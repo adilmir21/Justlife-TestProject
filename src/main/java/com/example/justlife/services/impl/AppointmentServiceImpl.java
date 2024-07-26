@@ -3,12 +3,15 @@ package com.example.justlife.services.impl;
 import com.example.justlife.dtos.AppointmentDTO;
 import com.example.justlife.dtos.CleaningProfessionalDTO;
 import com.example.justlife.dtos.ResponseDTO;
+import com.example.justlife.exceptions.InvalidArgumentsException;
 import com.example.justlife.exceptions.ResourceNotFoundException;
 import com.example.justlife.models.AppointmentEntity;
 import com.example.justlife.models.CleaningProfessionalEntity;
+import com.example.justlife.models.CustomerEntity;
 import com.example.justlife.models.VehicleEntity;
 import com.example.justlife.repositories.AppointmentRepository;
 import com.example.justlife.repositories.CleaningProfessionalRepository;
+import com.example.justlife.repositories.CustomerRepository;
 import com.example.justlife.repositories.VehicleRepository;
 import com.example.justlife.services.AppointmentService;
 import com.example.justlife.utils.Constants;
@@ -35,6 +38,7 @@ public class AppointmentServiceImpl implements AppointmentService {
     private static final LocalTime WORK_END_TIME = LocalTime.of(22, 0);
     private final AppointmentRepository appointmentRepository;
     private final CleaningProfessionalRepository cleaningProfessionalRepository;
+    private final CustomerRepository customerRepository;
 
     @Override
     public ResponseDTO<List<CleaningProfessionalDTO>> checkAvailability(LocalDate date) {
@@ -79,29 +83,39 @@ public class AppointmentServiceImpl implements AppointmentService {
         Long startTime = System.currentTimeMillis();
         ResponseDTO<AppointmentDTO> responseDTO = new ResponseDTO<>();
 
+        if (appointmentDTO.getDuration() == null ||
+                appointmentDTO.getCustomer() == null ||
+                appointmentDTO.getCleaningProfessionals() == null ||
+                appointmentDTO.getStartTime() == null) {
+            throw new InvalidArgumentsException("All fields are required");
+        }
+
         if (appointmentDTO.getStartTime().getDayOfWeek() == DayOfWeek.FRIDAY) {
-            throw new IllegalArgumentException("No cleaner works on Friday.");
+            throw new InvalidArgumentsException("No cleaner works on Friday.");
         }
         if (appointmentDTO.getStartTime().toLocalTime().isBefore(WORK_START_TIME)) {
-            throw new IllegalArgumentException("Appointment start time cannot be before 8 AM.");
+            throw new InvalidArgumentsException("Appointment start time cannot be before 8 AM.");
         }
 
         LocalDateTime appointmentEndTime = appointmentDTO.getStartTime().plusHours(appointmentDTO.getDuration());
 
         if (appointmentEndTime.toLocalTime().isAfter(WORK_END_TIME)) {
-            throw new IllegalArgumentException("Appointment end time cannot be after 10 PM.");
+            throw new InvalidArgumentsException("Appointment end time cannot be after 10 PM.");
         }
 
         if (appointmentDTO.getDuration() != 2 && appointmentDTO.getDuration() != 4) {
-            throw new IllegalArgumentException("Appointment duration must be 2 or 4.");
+            throw new InvalidArgumentsException("Appointment duration must be 2 or 4.");
         }
 
         if (appointmentDTO.getCleaningProfessionals().size() > 3 || appointmentDTO.getCleaningProfessionals().isEmpty()) {
-            throw new IllegalArgumentException("Appointment cleaning professionals must be between 1 and 3.");
+            throw new InvalidArgumentsException("Appointment cleaning professionals must be between 1 and 3.");
         }
 
         AppointmentEntity appointmentEntity = new AppointmentEntity();
         BeanUtils.copyProperties(appointmentDTO, appointmentEntity);
+
+        CustomerEntity customer = customerRepository.findById(appointmentDTO.getCustomer())
+                .orElseThrow(() -> new ResourceNotFoundException("Customer not found"));
 
         List<CleaningProfessionalEntity> professionals = appointmentDTO.getCleaningProfessionals().stream()
                 .map(id -> cleaningProfessionalRepository.findById(id)
@@ -109,14 +123,20 @@ public class AppointmentServiceImpl implements AppointmentService {
                 .toList();
 
         if (!areProfessionalsInSameVehicle(professionals)) {
-            throw new IllegalArgumentException("All cleaning professionals must be assigned to the same vehicle.");
+            throw new InvalidArgumentsException("All cleaning professionals must be assigned to the same vehicle.");
+        }
+
+        if (!areProfessionalsAvailable(professionals, appointmentDTO.getStartTime(), appointmentDTO.getDuration())) {
+            throw new InvalidArgumentsException("One or more cleaning professionals are not available during the selected time.");
         }
 
         appointmentEntity.setCleaningProfessionals(professionals);
+        appointmentEntity.setCustomer(customer);
         appointmentEntity.calculateEndTime();
 
         AppointmentDTO createdAppointmentDTO = new AppointmentDTO();
         BeanUtils.copyProperties(appointmentRepository.save(appointmentEntity), createdAppointmentDTO);
+        appointmentEntity.setId(createdAppointmentDTO.getId());
 
         updateProfessionalsAvailability(professionals, appointmentEntity);
 
@@ -147,6 +167,10 @@ public class AppointmentServiceImpl implements AppointmentService {
             throw new IllegalArgumentException("All cleaning professionals must be assigned to the same vehicle.");
         }
 
+        if (!areProfessionalsAvailable(professionals, appointmentDTO.getStartTime(), appointmentDTO.getDuration())) {
+            throw new InvalidArgumentsException("One or more cleaning professionals are not available during the selected time.");
+        }
+
         appointmentEntity.setCleaningProfessionals(professionals);
         appointmentEntity.setStartTime(appointmentDTO.getStartTime());
         appointmentEntity.setDuration(appointmentDTO.getDuration());
@@ -155,6 +179,7 @@ public class AppointmentServiceImpl implements AppointmentService {
         AppointmentDTO updatedAppointmentDTO = new AppointmentDTO();
         BeanUtils.copyProperties(appointmentRepository.save(appointmentEntity), updatedAppointmentDTO);
 
+        appointmentEntity.setId(updatedAppointmentDTO.getId());
         updateProfessionalsAvailability(professionals, appointmentEntity);
 
         responseDTO.setData(updatedAppointmentDTO);
@@ -171,14 +196,23 @@ public class AppointmentServiceImpl implements AppointmentService {
 
     private boolean isAvailableDuringPeriod(CleaningProfessionalEntity pro, LocalDateTime startTime, Integer duration) {
         LocalDateTime endTime = startTime.plusHours(duration);
+        LocalDateTime breakStartBefore = startTime.minusMinutes(30);
+        LocalDateTime breakEndAfter = endTime.plusMinutes(30);
+
         return pro.getAppointments().stream().noneMatch(appointment ->
-                appointment.getStartTime().isBefore(endTime) && appointment.getEndTime().isAfter(startTime));
+                (appointment.getStartTime().isBefore(breakEndAfter) && appointment.getEndTime().isAfter(startTime)) ||
+                        (appointment.getStartTime().isBefore(endTime) && appointment.getEndTime().isAfter(breakStartBefore)));
     }
+
 
     private boolean areProfessionalsInSameVehicle(List<CleaningProfessionalEntity> professionals) {
         if (professionals.isEmpty()) return true;
         VehicleEntity vehicle = professionals.get(0).getVehicle();
         return professionals.stream().allMatch(pro -> pro.getVehicle().equals(vehicle));
+    }
+
+    private boolean areProfessionalsAvailable(List<CleaningProfessionalEntity> professionals, LocalDateTime startTime, Integer duration) {
+        return professionals.stream().allMatch(pro -> isAvailableDuringPeriod(pro, startTime, duration));
     }
 
     private void updateProfessionalsAvailability(List<CleaningProfessionalEntity> professionals, AppointmentEntity appointment) {
